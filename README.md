@@ -1,4 +1,4 @@
-# gosigner
+# gopdfsigner
 
 A pure Go library for digitally signing and encrypting PDF documents.
 
@@ -9,7 +9,7 @@ boxes and AES password encryption (AES-128 or AES-256).
 ## Installation
 
 ```
-go get gosigner
+go get gopdfsigner
 ```
 
 Requires Go 1.21 or later.
@@ -19,12 +19,12 @@ Requires Go 1.21 or later.
 ### Sign a PDF file
 
 ```go
-signer, err := gosigner.NewSignerFromPFX("cert.pfx", "password")
+signer, err := gopdfsigner.NewSignerFromPFX("cert.pfx", "password")
 if err != nil {
     log.Fatal(err)
 }
 
-err = signer.Sign(gosigner.SignParams{
+err = signer.Sign(gopdfsigner.SignParams{
     Src:  "input.pdf",
     Dest: "signed.pdf",
 })
@@ -34,9 +34,9 @@ err = signer.Sign(gosigner.SignParams{
 
 ```go
 visible := true
-rect := gosigner.Rectangle{X1: 30, Y1: 720, X2: 280, Y2: 790}
+rect := gopdfsigner.Rectangle{X1: 30, Y1: 720, X2: 280, Y2: 790}
 
-err = signer.Sign(gosigner.SignParams{
+err = signer.Sign(gopdfsigner.SignParams{
     Src:      "input.pdf",
     Dest:     "signed.pdf",
     Visible:  &visible,
@@ -54,11 +54,11 @@ The example above places the signature box near the top-left of a US Letter page
 
 ```go
 err = signer.SignAndEncrypt(
-    gosigner.SignParams{
+    gopdfsigner.SignParams{
         Src:  "input.pdf",
         Dest: "signed-encrypted.pdf",
     },
-    gosigner.EncryptParams{
+    gopdfsigner.EncryptParams{
         Password: "secret",
     },
 )
@@ -70,11 +70,11 @@ permissions are restricted. For AES-256 encryption, set `AES256: true`:
 
 ```go
 err = signer.SignAndEncrypt(
-    gosigner.SignParams{
+    gopdfsigner.SignParams{
         Src:  "input.pdf",
         Dest: "signed-encrypted.pdf",
     },
-    gosigner.EncryptParams{
+    gopdfsigner.EncryptParams{
         Password: "secret",
         AES256:   true,
     },
@@ -88,7 +88,7 @@ Encryption is only available via `SignAndEncrypt`. The `Sign`, `SignBytes`, and
 
 ```go
 pdfData, _ := os.ReadFile("input.pdf")
-signedData, err := signer.SignBytes(pdfData, gosigner.SignParams{})
+signedData, err := signer.SignBytes(pdfData, gopdfsigner.SignParams{})
 ```
 
 ### Stream signing (low memory)
@@ -101,7 +101,7 @@ defer src.Close()
 dst, _ := os.Create("signed.pdf")
 defer dst.Close()
 
-err = signer.SignStream(src, dst, gosigner.SignParams{})
+err = signer.SignStream(src, dst, gopdfsigner.SignParams{})
 ```
 
 `SignStream` keeps heap usage at roughly 20KB regardless of PDF size. The
@@ -113,13 +113,13 @@ but never loaded into memory as a whole.
 From a PKCS#12 / PFX file:
 
 ```go
-signer, err := gosigner.NewSignerFromPFX("cert.pfx", "password")
+signer, err := gopdfsigner.NewSignerFromPFX("cert.pfx", "password")
 ```
 
 From PEM files:
 
 ```go
-signer, err := gosigner.NewSignerFromPEM("cert.pem", "key.pem")
+signer, err := gopdfsigner.NewSignerFromPEM("cert.pem", "key.pem")
 ```
 
 The PEM loader supports certificate chains: if `cert.pem` contains multiple
@@ -129,7 +129,7 @@ included as intermediates.
 From an already-parsed key and certificate:
 
 ```go
-signer, err := gosigner.NewSigner(gosigner.Config{
+signer, err := gopdfsigner.NewSigner(gopdfsigner.Config{
     Key:   rsaPrivateKey,
     Chain: []*x509.Certificate{signerCert, intermediateCert},
 })
@@ -141,20 +141,20 @@ Metadata and visibility settings can be set once on the `Config` and
 overridden per-document in `SignParams`:
 
 ```go
-signer, _ := gosigner.NewSigner(gosigner.Config{
+signer, _ := gopdfsigner.NewSigner(gopdfsigner.Config{
     Key:      key,
     Chain:    chain,
     Reason:   "Approved",
     Location: "HQ",
     Visible:  true,
-    Rect:     gosigner.Rectangle{X1: 30, Y1: 720, X2: 280, Y2: 790},
+    Rect:     gopdfsigner.Rectangle{X1: 30, Y1: 720, X2: 280, Y2: 790},
 })
 
 // Uses Config defaults:
-signer.Sign(gosigner.SignParams{Src: "a.pdf", Dest: "a-signed.pdf"})
+signer.Sign(gopdfsigner.SignParams{Src: "a.pdf", Dest: "a-signed.pdf"})
 
 // Overrides reason for this document:
-signer.Sign(gosigner.SignParams{Src: "b.pdf", Dest: "b-signed.pdf", Reason: "Reviewed"})
+signer.Sign(gopdfsigner.SignParams{Src: "b.pdf", Dest: "b-signed.pdf", Reason: "Reviewed"})
 ```
 
 ## API

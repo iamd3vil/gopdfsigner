@@ -1,4 +1,4 @@
-package gosigner
+package gopdfsigner
 
 import (
 	"bytes"
@@ -647,7 +647,7 @@ func (s *Signer) SignAndEncrypt(params SignParams, enc EncryptParams) error {
 	}
 
 	// Sign to a temp file, then encrypt to dest.
-	tmpFile, err := os.CreateTemp("", "gosigner-*.pdf")
+	tmpFile, err := os.CreateTemp("", "gopdfsigner-*.pdf")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}

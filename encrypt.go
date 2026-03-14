@@ -1,4 +1,4 @@
-package gosigner
+package gopdfsigner
 
 import (
 	"github.com/pdfcpu/pdfcpu/pkg/api"

@@ -1,4 +1,4 @@
-package gosigner
+package gopdfsigner
 
 import (
 	"bytes"
@@ -26,7 +26,7 @@ var (
 
 type contentInfo struct {
 	ContentType asn1.ObjectIdentifier
-	Content     asn1.RawValue `asn1:"explicit,tag:0"`
+	Content     asn1.RawValue `asn1:"explicit,optional,tag:0"`
 }
 
 type signedData struct {

@@ -1,4 +1,4 @@
-package gosigner
+package gopdfsigner
 
 import (
 	"crypto/rsa"

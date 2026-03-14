@@ -1,4 +1,4 @@
-module github.com/iamd3vil/gosigner
+module github.com/iamd3vil/gopdfsigner
 
 go 1.26.1
 
