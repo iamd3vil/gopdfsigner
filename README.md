@@ -186,37 +186,65 @@ All methods are safe for concurrent use from multiple goroutines.
 
 ## Performance
 
-Benchmarks on an Intel i7-1165G7 (4 cores / 8 threads), visible signing:
+All benchmarks use visible signing. Docs/sec = 1,000,000,000 ÷ ns/op.
 
-### Single-threaded (docs/sec)
+### Machines tested
 
-| PDF size | SignBytes | SignStream |
-|----------|-----------|------------|
-| 10 KB    | 624       | 642        |
-| 100 KB   | 470       | 636        |
-| 500 KB   | 298       | 726        |
-| 1 MB     | 212       | 558        |
-| 5 MB     | 82        | 120        |
+| Machine | CPU | Cores / Threads | OS |
+|---------|-----|----------------:|-----|
+| Laptop  | Intel i7-1165G7 | 4 / 8 | Linux |
+| Mac     | Apple M3 Pro | 11 | macOS |
+| Server  | AMD Ryzen 7 9700X | 8 / 16 | Linux |
 
-### 8 threads parallel (docs/sec)
+### Single-threaded — SignBytes (docs/sec)
 
-| PDF size | SignBytes | SignStream |
-|----------|-----------|------------|
-| 10 KB    | 3,247     | 871        |
-| 100 KB   | 2,849     | 767        |
-| 500 KB   | 2,160     | 558        |
-| 1 MB     | 1,239     | 564        |
-| 5 MB     | 300       | 212        |
+| PDF size | i7-1165G7 | M3 Pro | Ryzen 9700X |
+|----------|----------:|-------:|------------:|
+| 10 KB    | 624       | 1,158  | 1,754       |
+| 100 KB   | 470       | 1,115  | 1,614       |
+| 500 KB   | 298       | 957    | 1,205       |
+| 1 MB     | 212       | 804    | 882         |
+| 5 MB     | 82        | 354    | 316         |
+
+### Single-threaded — SignStream (docs/sec)
+
+| PDF size | i7-1165G7 | M3 Pro | Ryzen 9700X |
+|----------|----------:|-------:|------------:|
+| 10 KB    | 642       | 1,152  | 1,740       |
+| 100 KB   | 636       | 1,113  | 1,617       |
+| 500 KB   | 726       | 962    | 1,252       |
+| 1 MB     | 558       | 817    | 935         |
+| 5 MB     | 120       | 371    | 342         |
+
+### Parallel — SignBytes (docs/sec)
+
+| PDF size | i7-1165G7 (8T) | M3 Pro (11T) | Ryzen 9700X (16T) |
+|----------|---------------:|-------------:|-------------------:|
+| 10 KB    | 3,247          | 7,418        | 13,350             |
+| 100 KB   | 2,849          | 6,550        | 12,039             |
+| 500 KB   | 2,160          | 5,116        | 8,690              |
+| 1 MB     | 1,239          | 4,260        | 5,812              |
+| 5 MB     | 300            | 2,087        | 1,147              |
+
+### Parallel — SignStream (docs/sec)
+
+| PDF size | i7-1165G7 (8T) | M3 Pro (11T) | Ryzen 9700X (16T) |
+|----------|---------------:|-------------:|-------------------:|
+| 10 KB    | 871            | 7,634        | 13,477             |
+| 100 KB   | 767            | 6,938        | 12,389             |
+| 500 KB   | 558            | 5,352        | 9,621              |
+| 1 MB     | 564            | 4,270        | 7,193              |
+| 5 MB     | 212            | 1,982        | 2,241              |
 
 ### Memory per operation
 
 | PDF size | SignBytes | SignStream |
 |----------|----------|------------|
-| 10 KB    | 144 KB   | 116 KB     |
-| 100 KB   | 330 KB   | 210 KB     |
-| 500 KB   | 1,135 KB | 613 KB     |
-| 1 MB     | 2,195 KB | 1,147 KB   |
-| 5 MB     | 10,386 KB| 5,249 KB   |
+| 10 KB    | 103 KB   | 87 KB      |
+| 100 KB   | 293 KB   | 181 KB     |
+| 500 KB   | 1,096 KB | 583 KB     |
+| 1 MB     | 2,142 KB | 1,112 KB   |
+| 5 MB     | 10,332 KB| 5,200 KB   |
 
 Use `SignBytes` when throughput matters and data is already in memory. Use
 `SignStream` when working with files to cut heap usage by ~50%.
