@@ -4,7 +4,7 @@ A pure Go library for digitally signing and encrypting PDF documents.
 
 Produces PKCS#7 detached signatures (`/adbe.pkcs7.detached`) compatible with
 Adobe Acrobat, Poppler, and macOS Preview. Supports optional visible signature
-boxes and AES-128 password encryption.
+boxes and AES password encryption (AES-128 or AES-256).
 
 ## Installation
 
@@ -53,16 +53,36 @@ The example above places the signature box near the top-left of a US Letter page
 ### Sign and encrypt
 
 ```go
-err = signer.Sign(gosigner.SignParams{
-    Src:      "input.pdf",
-    Dest:     "signed-encrypted.pdf",
-    Password: "secret",
-})
+err = signer.SignAndEncrypt(
+    gosigner.SignParams{
+        Src:  "input.pdf",
+        Dest: "signed-encrypted.pdf",
+    },
+    gosigner.EncryptParams{
+        Password: "secret",
+    },
+)
 ```
 
 This signs first, then applies AES-128 encryption with the given password as
 both the user and owner password. Print permission is allowed; all other
-permissions are restricted.
+permissions are restricted. For AES-256 encryption, set `AES256: true`:
+
+```go
+err = signer.SignAndEncrypt(
+    gosigner.SignParams{
+        Src:  "input.pdf",
+        Dest: "signed-encrypted.pdf",
+    },
+    gosigner.EncryptParams{
+        Password: "secret",
+        AES256:   true,
+    },
+)
+```
+
+Encryption is only available via `SignAndEncrypt`. The `Sign`, `SignBytes`, and
+`SignStream` methods do not accept encryption parameters.
 
 ### Sign in memory
 
@@ -149,6 +169,9 @@ func NewSignerFromPEM(certPath, keyPath string) (*Signer, error)
 func (s *Signer) Sign(params SignParams) error
 func (s *Signer) SignBytes(pdfData []byte, params SignParams) ([]byte, error)
 func (s *Signer) SignStream(src io.ReadSeeker, dst io.Writer, params SignParams) error
+
+// Signing + encryption
+func (s *Signer) SignAndEncrypt(params SignParams, enc EncryptParams) error
 ```
 
 `Sign` reads from `Src`, writes to `Dest`. If `Dest` is empty, it overwrites `Src`.
@@ -157,7 +180,9 @@ func (s *Signer) SignStream(src io.ReadSeeker, dst io.Writer, params SignParams)
 
 `SignStream` is the most memory-efficient path for large files.
 
-All three methods are safe for concurrent use from multiple goroutines.
+`SignAndEncrypt` signs to a temp file, then encrypts to `Dest` using pdfcpu.
+
+All methods are safe for concurrent use from multiple goroutines.
 
 ## Performance
 
@@ -226,8 +251,8 @@ The fixed overhead is ~1.3ms for RSA-2048 PKCS#1v1.5 signing (the
 6. The DER-encoded PKCS#7 is hex-encoded and patched into the Contents
    placeholder.
 
-7. If encryption is requested, pdfcpu applies AES-128 encryption as a
-   post-processing step on the signed output.
+7. If encryption is requested, pdfcpu applies AES encryption (128-bit or
+   256-bit) as a post-processing step on the signed output.
 
 ## Limitations
 
@@ -238,8 +263,7 @@ The fixed overhead is ~1.3ms for RSA-2048 PKCS#1v1.5 signing (the
 - No timestamp authority (TSA) integration. Signatures include a local
   signing time but no RFC 3161 timestamp.
 - No PDF/A compliance.
-- Encryption is AES-128 only (V=4, R=4). AES-256 requires pdfcpu
-  configuration changes.
+- Encryption supports AES-128 (default) and AES-256. No RC4 support.
 - The visible signature uses Helvetica and a fixed layout. Custom fonts and
   images are not supported.
 
@@ -247,7 +271,7 @@ The fixed overhead is ~1.3ms for RSA-2048 PKCS#1v1.5 signing (the
 
 | Dependency | Purpose |
 |------------|---------|
-| `github.com/pdfcpu/pdfcpu` | PDF parsing, object model, AES-128 encryption |
+| `github.com/pdfcpu/pdfcpu` | PDF parsing, object model, AES encryption |
 | `golang.org/x/crypto/pkcs12` | PKCS#12 / PFX file decoding |
 | `software.sslmate.com/src/go-pkcs12` | Fallback PFX decoder for modern digest algorithms |
 

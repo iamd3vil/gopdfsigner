@@ -12,23 +12,35 @@ func TestEncryptPDF(t *testing.T) {
 		t.Fatalf("read input PDF: %v", err)
 	}
 
-	dir := t.TempDir()
-	inPath := filepath.Join(dir, "input.pdf")
-	outPath := filepath.Join(dir, "encrypted.pdf")
-
-	if err := os.WriteFile(inPath, inData, 0o644); err != nil {
-		t.Fatalf("write temp input PDF: %v", err)
+	tests := []struct {
+		name      string
+		keyLength int
+	}{
+		{"AES-128", 128},
+		{"AES-256", 256},
 	}
 
-	if err := encryptPDF(inPath, outPath, "secret"); err != nil {
-		t.Fatalf("encryptPDF returned error: %v", err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			inPath := filepath.Join(dir, "input.pdf")
+			outPath := filepath.Join(dir, "encrypted.pdf")
 
-	outData, err := os.ReadFile(outPath)
-	if err != nil {
-		t.Fatalf("read encrypted output PDF: %v", err)
-	}
-	if len(outData) == 0 {
-		t.Fatal("encrypted output file is empty")
+			if err := os.WriteFile(inPath, inData, 0o644); err != nil {
+				t.Fatalf("write temp input PDF: %v", err)
+			}
+
+			if err := encryptPDF(inPath, outPath, "secret", tt.keyLength); err != nil {
+				t.Fatalf("encryptPDF(%s) returned error: %v", tt.name, err)
+			}
+
+			outData, err := os.ReadFile(outPath)
+			if err != nil {
+				t.Fatalf("read encrypted output PDF: %v", err)
+			}
+			if len(outData) == 0 {
+				t.Fatalf("encrypted output file (%s) is empty", tt.name)
+			}
+		})
 	}
 }

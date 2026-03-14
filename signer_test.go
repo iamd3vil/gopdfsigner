@@ -152,27 +152,63 @@ func TestSignStreamToDiscard(t *testing.T) {
 	}
 }
 
-func TestSignWithEncryption(t *testing.T) {
+func TestSignAndEncrypt(t *testing.T) {
+	signer, err := NewSignerFromPFX(filepath.Join("testdata", "test.pfx"), "test123")
+	if err != nil {
+		t.Fatalf("create signer: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		aes256 bool
+	}{
+		{"AES-128", false},
+		{"AES-256", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outPath := filepath.Join(t.TempDir(), "signed-encrypted.pdf")
+			err = signer.SignAndEncrypt(
+				SignParams{
+					Src:  filepath.Join("testdata", "test.pdf"),
+					Dest: outPath,
+				},
+				EncryptParams{
+					Password: "secret",
+					AES256:   tt.aes256,
+				},
+			)
+			if err != nil {
+				t.Fatalf("SignAndEncrypt with %s returned error: %v", tt.name, err)
+			}
+
+			outData, err := os.ReadFile(outPath)
+			if err != nil {
+				t.Fatalf("read encrypted output file: %v", err)
+			}
+			if len(outData) == 0 {
+				t.Fatalf("encrypted output file (%s) is empty", tt.name)
+			}
+		})
+	}
+}
+
+func TestSignAndEncryptEmptyPassword(t *testing.T) {
 	signer, err := NewSignerFromPFX(filepath.Join("testdata", "test.pfx"), "test123")
 	if err != nil {
 		t.Fatalf("create signer: %v", err)
 	}
 
 	outPath := filepath.Join(t.TempDir(), "signed-encrypted.pdf")
-	err = signer.Sign(SignParams{
-		Src:      filepath.Join("testdata", "test.pdf"),
-		Dest:     outPath,
-		Password: "secret",
-	})
-	if err != nil {
-		t.Fatalf("Sign with encryption returned error: %v", err)
-	}
-
-	outData, err := os.ReadFile(outPath)
-	if err != nil {
-		t.Fatalf("read encrypted output file: %v", err)
-	}
-	if len(outData) == 0 {
-		t.Fatal("encrypted output file is empty")
+	err = signer.SignAndEncrypt(
+		SignParams{
+			Src:  filepath.Join("testdata", "test.pdf"),
+			Dest: outPath,
+		},
+		EncryptParams{},
+	)
+	if err == nil {
+		t.Fatal("expected error for empty password, got nil")
 	}
 }

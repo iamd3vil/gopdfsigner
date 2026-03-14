@@ -31,17 +31,22 @@ type Config struct {
 // SignParams holds per-document signing parameters.
 // Zero values mean "use Config defaults".
 type SignParams struct {
-	Src  string // Input PDF file path
-	Dest string // Output PDF file path
+	Src  string // Input PDF file path (used by Sign and SignAndEncrypt)
+	Dest string // Output PDF file path (used by Sign and SignAndEncrypt)
 
 	// Optional per-document overrides
-	Password string     // If set, encrypt output with AES-128
 	Reason   string     // Override Config.Reason
 	Contact  string     // Override Config.Contact
 	Location string     // Override Config.Location
 	Page     int        // Override Config.Page
 	Rect     *Rectangle // Override Config.Rect (nil = use default)
 	Visible  *bool      // Override Config.Visible (nil = use default)
+}
+
+// EncryptParams holds encryption parameters for SignAndEncrypt.
+type EncryptParams struct {
+	Password string // User and owner password for AES encryption (required)
+	AES256   bool   // Use AES-256 instead of AES-128 (default: false)
 }
 
 // Signer signs PDF documents with PKCS#7 digital signatures.

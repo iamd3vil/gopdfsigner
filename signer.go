@@ -616,26 +616,6 @@ func (s *Signer) Sign(params SignParams) error {
 		destPath = params.Src
 	}
 
-	// When encrypting, sign to a temp file first, then encrypt to dest.
-	if params.Password != "" {
-		tmpFile, err := os.CreateTemp("", "gosigner-*.pdf")
-		if err != nil {
-			return fmt.Errorf("create temp file: %w", err)
-		}
-		tmpPath := tmpFile.Name()
-		defer os.Remove(tmpPath)
-
-		if err := s.SignStream(srcFile, tmpFile, params); err != nil {
-			tmpFile.Close()
-			return fmt.Errorf("sign PDF: %w", err)
-		}
-		if err := tmpFile.Close(); err != nil {
-			return fmt.Errorf("close temp file: %w", err)
-		}
-		return encryptPDF(tmpPath, destPath, params.Password)
-	}
-
-	// No encryption: sign directly to dest file.
 	dstFile, err := os.Create(destPath)
 	if err != nil {
 		return fmt.Errorf("create output PDF: %w", err)
@@ -646,6 +626,47 @@ func (s *Signer) Sign(params SignParams) error {
 		return fmt.Errorf("sign PDF: %w", err)
 	}
 	return nil
+}
+
+// SignAndEncrypt signs a PDF file and then encrypts it with AES.
+// It writes the signed and encrypted result to the destination path.
+func (s *Signer) SignAndEncrypt(params SignParams, enc EncryptParams) error {
+	if enc.Password == "" {
+		return fmt.Errorf("EncryptParams.Password is required")
+	}
+
+	srcFile, err := os.Open(params.Src)
+	if err != nil {
+		return fmt.Errorf("open input PDF: %w", err)
+	}
+	defer srcFile.Close()
+
+	destPath := params.Dest
+	if destPath == "" {
+		destPath = params.Src
+	}
+
+	// Sign to a temp file, then encrypt to dest.
+	tmpFile, err := os.CreateTemp("", "gosigner-*.pdf")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if err := s.SignStream(srcFile, tmpFile, params); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("sign PDF: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+
+	keyLength := 128
+	if enc.AES256 {
+		keyLength = 256
+	}
+	return encryptPDF(tmpPath, destPath, enc.Password, keyLength)
 }
 
 // SignBytes signs PDF bytes in memory and returns the signed PDF bytes.
