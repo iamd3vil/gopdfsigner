@@ -44,7 +44,8 @@ func TestBuildPKCS7Signature(t *testing.T) {
 	}
 
 	hash := sha256.Sum256([]byte("test"))
-	sig, err := buildPKCS7Signature(rsaKey, []*x509.Certificate{cert}, hash[:], time.Now().UTC())
+	certDER := cert.Raw
+	sig, err := buildPKCS7Signature(rsaKey, []*x509.Certificate{cert}, certDER, hash[:], time.Now().UTC())
 	if err != nil {
 		t.Fatalf("buildPKCS7Signature returned error: %v", err)
 	}

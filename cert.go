@@ -7,7 +7,11 @@ import (
 	"fmt"
 	"os"
 
+	// Standard Go PKCS#12 library — works for most PFX files but fails on
+	// files using modern digest algorithms (e.g. SHA-256 MAC).
 	"golang.org/x/crypto/pkcs12"
+	// Fallback PKCS#12 library that supports modern algorithms and also
+	// extracts the full CA chain (not just the leaf cert).
 	pkcs12modern "software.sslmate.com/src/go-pkcs12"
 )
 
@@ -18,6 +22,8 @@ func NewSignerFromPFX(pfxPath string, password string) (*Signer, error) {
 		return nil, fmt.Errorf("read pfx file: %w", err)
 	}
 
+	// Try the standard library first. If it fails (e.g. the PFX uses SHA-256 MAC),
+	// fall back to go-pkcs12 which also extracts intermediate CA certificates.
 	key, cert, err := pkcs12.Decode(pfxData, password)
 	if err != nil {
 		fallbackKey, fallbackCert, caCerts, fallbackErr := pkcs12modern.DecodeChain(pfxData, password)
@@ -25,6 +31,7 @@ func NewSignerFromPFX(pfxPath string, password string) (*Signer, error) {
 			return nil, fmt.Errorf("decode pfx: %w", err)
 		}
 
+		// Build the chain with the leaf cert first, followed by any intermediates.
 		chain := make([]*x509.Certificate, 0, 1+len(caCerts))
 		chain = append(chain, fallbackCert)
 		chain = append(chain, caCerts...)
@@ -48,6 +55,9 @@ func NewSignerFromPEM(certPath string, keyPath string) (*Signer, error) {
 		return nil, fmt.Errorf("read certificate file: %w", err)
 	}
 
+	// Parse all PEM blocks in the file to build the certificate chain.
+	// The file may contain multiple certificates (leaf + intermediates).
+	// Non-CERTIFICATE blocks (e.g. comments, other key types) are skipped.
 	var chain []*x509.Certificate
 	for len(certPEM) > 0 {
 		var block *pem.Block
@@ -81,6 +91,8 @@ func NewSignerFromPEM(certPath string, keyPath string) (*Signer, error) {
 		return nil, fmt.Errorf("failed to decode key PEM block")
 	}
 
+	// Try PKCS#8 first (modern format, wraps algorithm identifier + key).
+	// Fall back to PKCS#1 (legacy RSA-only format) if PKCS#8 parsing fails.
 	key, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
 	if err != nil {
 		rsaKey, pkcs1Err := x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
@@ -97,6 +109,8 @@ func NewSignerFromPEM(certPath string, keyPath string) (*Signer, error) {
 }
 
 // NewSigner creates a signer from an already-parsed configuration.
+// Currently only RSA private keys are supported; ECDSA/Ed25519 will
+// be rejected since PDF PKCS#7 signatures typically use RSA+SHA256.
 func NewSigner(cfg Config) (*Signer, error) {
 	if cfg.Key == nil {
 		return nil, fmt.Errorf("private key is required")
@@ -104,9 +118,26 @@ func NewSigner(cfg Config) (*Signer, error) {
 	if len(cfg.Chain) == 0 {
 		return nil, fmt.Errorf("certificate chain must contain at least one certificate")
 	}
-	if _, ok := cfg.Key.(*rsa.PrivateKey); !ok {
+	rsaKey, ok := cfg.Key.(*rsa.PrivateKey)
+	if !ok {
 		return nil, fmt.Errorf("private key must be RSA")
 	}
+	// Pre-compute CRT values for faster RSA signing if not already done.
+	rsaKey.Precompute()
 
-	return &Signer{cfg: cfg}, nil
+	// Pre-compute DER-encoded certificate chain to avoid per-call allocation.
+	var totalLen int
+	for _, cert := range cfg.Chain {
+		if cert != nil {
+			totalLen += len(cert.Raw)
+		}
+	}
+	certDER := make([]byte, 0, totalLen)
+	for _, cert := range cfg.Chain {
+		if cert != nil {
+			certDER = append(certDER, cert.Raw...)
+		}
+	}
+
+	return &Signer{cfg: cfg, certBytesDER: certDER}, nil
 }

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/rsa"
 	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"hash"
 	"io"
@@ -21,13 +20,26 @@ import (
 )
 
 const (
-	contentsPlaceholderLen = 16384 // Hex chars for 8192 bytes.
-	byteRangePlaceholder   = "/ByteRange [0 0000000000 0000000000 0000000000]"
+	// contentsPlaceholderLen is the number of hex characters reserved for the
+	// PKCS#7 DER-encoded signature. 3072 hex chars = 1536 bytes, which is enough
+	// for RSA-2048 signatures with typical certificate chains (~1400 bytes).
+	contentsPlaceholderLen = 3072
+
+	// byteRangePlaceholder is written into the signature dictionary initially with
+	// zero offsets. It gets patched in-place after the increment is built and
+	// the actual byte positions are known. The fixed width (zero-padded to 10 digits)
+	// ensures the patched value is the same length so no bytes shift.
+	byteRangePlaceholder = "/ByteRange [0 0000000000 0000000000 0000000000]"
 )
 
 // Pre-computed zeros placeholder (avoids strings.Repeat allocation per call).
 var contentsZeros = strings.Repeat("0", contentsPlaceholderLen)
 
+// Object pools for concurrent-safe reuse of allocations across signing calls.
+// These reduce GC pressure significantly when signing many PDFs in sequence.
+
+// bufPool provides reusable bytes.Buffer instances (pre-grown to 32KB) for
+// building the incremental update.
 var bufPool = sync.Pool{
 	New: func() any {
 		b := new(bytes.Buffer)
@@ -36,19 +48,60 @@ var bufPool = sync.Pool{
 	},
 }
 
+// hashPool provides reusable SHA-256 hash instances. Each is Reset() before use.
 var hashPool = sync.Pool{
 	New: func() any {
 		return sha256.New()
 	},
 }
 
-var hexBufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, contentsPlaceholderLen)
-		return &b
-	},
+// appendZeroPad10 appends a 10-digit zero-padded decimal representation of n to dst.
+func appendZeroPad10(dst []byte, n int64) []byte {
+	var tmp [10]byte
+	v := n
+	for i := 9; i >= 0; i-- {
+		tmp[i] = byte('0' + v%10)
+		v /= 10
+	}
+	return append(dst, tmp[:]...)
 }
 
+// formatByteRange formats the ByteRange string directly into dst starting at pos.
+// Returns the number of bytes written. Format: "/ByteRange [0 XXXXXXXXXX XXXXXXXXXX XXXXXXXXXX]"
+func formatByteRange(dst []byte, pos int, a, b, c int64) {
+	copy(dst[pos:], "/ByteRange [0 ")
+	p := pos + 14
+	var tmp [10]byte
+	for _, v := range [3]int64{a, b, c} {
+		for i := 9; i >= 0; i-- {
+			tmp[i] = byte('0' + v%10)
+			v /= 10
+		}
+		copy(dst[p:], tmp[:])
+		p += 10
+		if p-pos < len(byteRangePlaceholder) {
+			dst[p] = ' '
+			p++
+		}
+	}
+	dst[p-1] = ']' // overwrite last space with ']'
+}
+
+// upperHex is a lookup table for uppercase hex encoding.
+// Index i maps to the two hex characters representing byte value i.
+const upperHexChars = "0123456789ABCDEF"
+
+// encodeUpperHex encodes src into uppercase hex and writes into dst.
+// dst must be at least hex.EncodedLen(len(src)) bytes.
+func encodeUpperHex(dst, src []byte) {
+	for i, b := range src {
+		dst[i*2] = upperHexChars[b>>4]
+		dst[i*2+1] = upperHexChars[b&0x0f]
+	}
+}
+
+// resolveParams merges per-document SignParams with the Config defaults.
+// Zero/nil values in SignParams fall through to Config values.
 func (s *Signer) resolveParams(params SignParams) (reason, contact, location string, page int, rect Rectangle, visible bool) {
 	reason = s.cfg.Reason
 	if params.Reason != "" {
@@ -80,6 +133,8 @@ func (s *Signer) resolveParams(params SignParams) (reason, contact, location str
 	return
 }
 
+// signerName extracts a human-readable name from the signer certificate.
+// It tries CommonName first, then Organization, falling back to the serial number.
 func (s *Signer) signerName() string {
 	if len(s.cfg.Chain) > 0 && s.cfg.Chain[0] != nil {
 		cert := s.cfg.Chain[0]
@@ -110,16 +165,21 @@ func findStartxrefFromReader(src io.ReadSeeker, srcSize int64) (int64, error) {
 	return findStartxrefOffset(tail)
 }
 
+// findStartxrefOffset parses the "startxref\n<offset>" marker from a byte slice
+// (typically the last 1KB of the PDF). Uses LastIndex to find the final occurrence,
+// since PDFs with incremental updates may have multiple startxref markers.
 func findStartxrefOffset(data []byte) (int64, error) {
 	idx := bytes.LastIndex(data, []byte("startxref"))
 	if idx == -1 {
 		return 0, fmt.Errorf("startxref not found")
 	}
+	// Skip whitespace between "startxref" keyword and the numeric offset.
 	rest := data[idx+len("startxref"):]
 	i := 0
 	for i < len(rest) && (rest[i] == ' ' || rest[i] == '\n' || rest[i] == '\r' || rest[i] == '\t') {
 		i++
 	}
+	// Extract the decimal offset value.
 	j := i
 	for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
 		j++
@@ -134,6 +194,9 @@ func findStartxrefOffset(data []byte) (int64, error) {
 	return offset, nil
 }
 
+// serializeObject converts a pdfcpu Object into its PDF syntax string.
+// Prefers PDFString() if available (which handles quoting/escaping), otherwise
+// falls back to Go's default formatting.
 func serializeObject(obj types.Object) string {
 	if obj == nil {
 		return "null"
@@ -144,6 +207,8 @@ func serializeObject(obj types.Object) string {
 	return fmt.Sprintf("%v", obj)
 }
 
+// getPageInfo traverses the PDF page tree to find the indirect reference and
+// dictionary for the given 1-indexed page number.
 func getPageInfo(ctx *model.Context, pageNum int) (types.IndirectRef, types.Dict, error) {
 	rootObj, err := ctx.Dereference(*ctx.Root)
 	if err != nil {
@@ -160,6 +225,9 @@ func getPageInfo(ctx *model.Context, pageNum int) (types.IndirectRef, types.Dict
 	return resolvePageRef(ctx, *pagesRef, pageNum)
 }
 
+// resolvePageRef recursively walks the page tree (Pages nodes with Kids arrays)
+// to find the target page. It counts leaf Page nodes, and for intermediate Pages
+// nodes uses the /Count entry to skip subtrees efficiently.
 func resolvePageRef(ctx *model.Context, nodeRef types.IndirectRef, targetPage int) (types.IndirectRef, types.Dict, error) {
 	obj, err := ctx.Dereference(nodeRef)
 	if err != nil {
@@ -215,31 +283,40 @@ func resolvePageRef(ctx *model.Context, nodeRef types.IndirectRef, targetPage in
 	return types.IndirectRef{}, nil, fmt.Errorf("page %d not found", targetPage)
 }
 
-// pdfStructure holds the PDF metadata extracted from parsing, needed to build
-// the incremental update.
+// pdfStructure holds the minimal PDF metadata extracted from parsing, needed to
+// build the incremental update. We only parse what's strictly necessary for signing
+// — no full DOM, no content stream parsing.
 type pdfStructure struct {
-	nextObjNr      int
-	prevXrefOffset int64
-	catalogObjNr   int
-	catalogDict    types.Dict
-	pageObjNr      int
-	pageDict       types.Dict
-	infoRef        *types.IndirectRef
-	idArray        types.Array
+	nextObjNr      int                // next available object number for new objects
+	prevXrefOffset int64              // byte offset of the most recent xref table (for /Prev chain)
+	catalogObjNr   int                // object number of the document catalog (we rewrite it)
+	catalogDict    types.Dict         // catalog dictionary (we add /AcroForm to it)
+	pageObjNr      int                // object number of the target page (we add /Annots to it)
+	pageDict       types.Dict         // target page dictionary
+	infoRef        *types.IndirectRef // optional /Info reference (preserved in trailer)
+	idArray        types.Array        // optional /ID array (preserved in trailer for identity)
 }
 
 // parsePDFStructure reads the minimal structure needed for signing from src.
+// It extracts the xref offset, catalog, and target page — just enough to build
+// a valid incremental update. We read the startxref offset ourselves (rather than
+// relying on pdfcpu) because we need the exact byte position for the /Prev pointer
+// in our new trailer.
 func parsePDFStructure(src io.ReadSeeker, page int) (*pdfStructure, error) {
 	srcSize, err := src.Seek(0, io.SeekEnd)
 	if err != nil {
 		return nil, fmt.Errorf("seek end: %w", err)
 	}
 
+	// Find the last startxref offset before using pdfcpu to parse.
+	// We need this raw value for our incremental update's /Prev pointer.
 	prevXrefOffset, err := findStartxrefFromReader(src, srcSize)
 	if err != nil {
 		return nil, fmt.Errorf("find startxref: %w", err)
 	}
 
+	// Use pdfcpu to parse and validate the full PDF structure. This gives us
+	// access to the object tree, page tree, and cross-reference table.
 	if _, err := src.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("seek start: %w", err)
 	}
@@ -264,7 +341,10 @@ func parsePDFStructure(src io.ReadSeeker, page int) (*pdfStructure, error) {
 		return nil, fmt.Errorf("get page %d: %w", page, err)
 	}
 
-	// Resolve any indirect AcroForm reference while we still have ctx
+	// Resolve indirect references for AcroForm and Annots while we still have
+	// the pdfcpu context. We need the actual dict/array values (not indirect refs)
+	// because we'll serialize modified versions of these into the incremental update.
+	// If we didn't resolve them here, we'd write broken indirect references.
 	if ref := catalogDict.IndirectRefEntry("AcroForm"); ref != nil {
 		if o, derr := ctx.Dereference(*ref); derr == nil {
 			if d, ok := o.(types.Dict); ok {
@@ -272,7 +352,6 @@ func parsePDFStructure(src io.ReadSeeker, page int) (*pdfStructure, error) {
 			}
 		}
 	}
-	// Resolve any indirect Annots reference on the page
 	if ref := pageDict.IndirectRefEntry("Annots"); ref != nil {
 		if o, derr := ctx.Dereference(*ref); derr == nil {
 			if arr, ok := o.(types.Array); ok {
@@ -294,9 +373,21 @@ func parsePDFStructure(src io.ReadSeeker, page int) (*pdfStructure, error) {
 	return ps, nil
 }
 
-// buildIncrement builds the incremental update buffer and returns it along with
-// the byte-range-relative offsets within the increment for ByteRange placeholder,
-// Contents hex start/end (all relative to start of incr, not absolute).
+// buildIncrement constructs the PDF incremental update buffer that gets appended
+// after the original PDF bytes. The incremental update contains:
+//   - Signature value dictionary (/Type /Sig with /SubFilter /adbe.pkcs7.detached)
+//   - Widget annotation linking the signature to a page
+//   - Visible appearance stream and font (if visible=true)
+//   - Modified catalog dictionary (adds /AcroForm with signature field)
+//   - Modified page dictionary (adds widget to /Annots)
+//   - Cross-reference table for all new/modified objects
+//   - Trailer with /Prev pointing to the original xref
+//
+// The ByteRange and Contents fields are written with fixed-width placeholders
+// that get patched in-place by the caller after the final byte positions are known.
+//
+// incrOffsets tracks where the placeholders are within the buffer so the caller
+// can patch them without re-scanning.
 type incrOffsets struct {
 	byteRangeInIncr    int // offset of ByteRange placeholder within incr
 	contentsHexInIncr  int // offset of first hex char of Contents within incr
@@ -306,6 +397,9 @@ type incrOffsets struct {
 func (s *Signer) buildIncrement(ps *pdfStructure, srcSize int64, reason, contact, location string, rect Rectangle, visible bool, signingTime time.Time) (*bytes.Buffer, *incrOffsets, error) {
 	signerName := s.signerName()
 
+	// Allocate object numbers sequentially starting from the next available.
+	// We always create at least 2 new objects (sig value + widget); visible
+	// signatures add 2 more (appearance XObject + font).
 	sigValueObjNr := ps.nextObjNr
 	widgetObjNr := ps.nextObjNr + 1
 	nextObj := ps.nextObjNr + 2
@@ -320,8 +414,11 @@ func (s *Signer) buildIncrement(ps *pdfStructure, srcSize int64, reason, contact
 
 	incr := bufPool.Get().(*bytes.Buffer)
 	incr.Reset()
-	incr.WriteByte('\n')
+	incr.WriteByte('\n') // separator between original PDF and incremental update
 
+	// Track xref entries: object number -> absolute byte offset.
+	// recordOffset captures the current write position as the absolute offset
+	// for an object (srcSize + current buffer position).
 	xrefEntries := map[int]int64{}
 	baseOffset := srcSize
 	recordOffset := func(objNr int) {
@@ -361,6 +458,9 @@ func (s *Signer) buildIncrement(ps *pdfStructure, srcSize int64, reason, contact
 	fmt.Fprintf(incr, "endobj\n\n")
 
 	// === Widget Annotation ===
+	// The widget annotation combines the form field (/FT /Sig) and its visual
+	// representation. /F 132 = Print (bit 3) + Locked (bit 8), ensuring the
+	// signature appears when printing but can't be moved/resized.
 	recordOffset(widgetObjNr)
 	fmt.Fprintf(incr, "%d 0 obj\n", widgetObjNr)
 	fmt.Fprintf(incr, "<<\n")
@@ -412,12 +512,16 @@ func (s *Signer) buildIncrement(ps *pdfStructure, srcSize int64, reason, contact
 	}
 
 	// === Modified Catalog ===
+	// We rewrite the catalog to add/update the /AcroForm dictionary with our
+	// signature field. Existing AcroForm fields are preserved. /SigFlags 3 means
+	// SignaturesExist (bit 1) + AppendOnly (bit 2), telling PDF viewers that the
+	// document contains signatures and should be opened in append-only mode.
 	recordOffset(ps.catalogObjNr)
 	fmt.Fprintf(incr, "%d 0 obj\n", ps.catalogObjNr)
 	fmt.Fprintf(incr, "<<\n")
 	for key, val := range ps.catalogDict {
 		if key == "AcroForm" {
-			continue
+			continue // handled separately below
 		}
 		fmt.Fprintf(incr, "/%s %s\n", key, serializeObject(val))
 	}
@@ -434,12 +538,14 @@ func (s *Signer) buildIncrement(ps *pdfStructure, srcSize int64, reason, contact
 	fmt.Fprintf(incr, "endobj\n\n")
 
 	// === Modified Page ===
+	// Rewrite the target page to append our widget annotation to the /Annots array.
+	// Existing annotations are preserved.
 	recordOffset(ps.pageObjNr)
 	fmt.Fprintf(incr, "%d 0 obj\n", ps.pageObjNr)
 	fmt.Fprintf(incr, "<<\n")
 	for key, val := range ps.pageDict {
 		if key == "Annots" {
-			continue
+			continue // handled separately below
 		}
 		fmt.Fprintf(incr, "/%s %s\n", key, serializeObject(val))
 	}
@@ -454,6 +560,9 @@ func (s *Signer) buildIncrement(ps *pdfStructure, srcSize int64, reason, contact
 	fmt.Fprintf(incr, "endobj\n\n")
 
 	// === Cross-reference table ===
+	// Each modified/new object gets an entry. We write each as a single-object
+	// subsection ("objNr 1\n") which is valid per the PDF spec and avoids needing
+	// to compute contiguous ranges.
 	xrefOffset := baseOffset + int64(incr.Len())
 	fmt.Fprintf(incr, "xref\n")
 	objNrs := make([]int, 0, len(xrefEntries))
@@ -467,6 +576,9 @@ func (s *Signer) buildIncrement(ps *pdfStructure, srcSize int64, reason, contact
 	}
 
 	// === Trailer ===
+	// /Prev points to the previous xref table, forming a chain that lets PDF
+	// readers find all objects across the original file and this update.
+	// /Info and /ID are preserved from the original to maintain document identity.
 	fmt.Fprintf(incr, "trailer\n")
 	fmt.Fprintf(incr, "<<\n")
 	fmt.Fprintf(incr, "/Size %d\n", nextObj)
@@ -515,23 +627,23 @@ func (s *Signer) SignStream(src io.ReadSeeker, dst io.Writer, params SignParams)
 
 	incrBytes := incr.Bytes()
 
-	// Compute absolute positions for ByteRange.
-	// The Contents placeholder '<' is at absolute position srcSize + contentsHexInIncr - 1
-	// (the -1 accounts for the '<' before the hex digits).
+	// Compute absolute byte positions for the ByteRange array.
+	//
+	// The ByteRange defines which parts of the file are signed. It excludes the
+	// Contents value (the hex-encoded PKCS#7 signature) so that the signature
+	// doesn't sign itself. The layout is:
+	//
+	//   [0, contentValueStart) — signed range 1 (original PDF + incr before '<')
+	//   [contentValueStart, contentValueEnd) — the <hex...> Contents value (excluded)
+	//   [contentValueEnd, totalLen) — signed range 2 (incr after '>')
+	//
+	// The -1/+1 account for the '<' and '>' delimiters around the hex string.
 	contentValueStart := srcSize + int64(offsets.contentsHexInIncr) - 1 // position of '<'
 	contentValueEnd := srcSize + int64(offsets.contentsHexEndIncr) + 1  // position after '>'
 	totalLen := srcSize + int64(len(incrBytes))
 
-	// Patch ByteRange in the increment buffer.
-	byteRange := fmt.Sprintf("/ByteRange [0 %010d %010d %010d]",
-		contentValueStart,
-		contentValueEnd,
-		totalLen-contentValueEnd,
-	)
-	if len(byteRange) != len(byteRangePlaceholder) {
-		return fmt.Errorf("ByteRange length mismatch: got %d, want %d", len(byteRange), len(byteRangePlaceholder))
-	}
-	copy(incrBytes[offsets.byteRangeInIncr:], []byte(byteRange))
+	// Patch ByteRange directly in the increment buffer (no fmt.Sprintf allocation).
+	formatByteRange(incrBytes, offsets.byteRangeInIncr, contentValueStart, contentValueEnd, totalLen-contentValueEnd)
 
 	// Hash the signed byte ranges: [0, contentValueStart) and [contentValueEnd, totalLen).
 	// The first range is: all of src + incr[0 : contentsHexInIncr-1]
@@ -565,29 +677,20 @@ func (s *Signer) SignStream(src io.ReadSeeker, dst io.Writer, params SignParams)
 	if !ok {
 		return fmt.Errorf("private key must be RSA")
 	}
-	pkcs7Sig, err := buildPKCS7Signature(rsaKey, s.cfg.Chain, contentHash, signingTime)
+	pkcs7Sig, err := buildPKCS7Signature(rsaKey, s.cfg.Chain, s.certBytesDER, contentHash, signingTime)
 	if err != nil {
 		return fmt.Errorf("build PKCS#7 signature: %w", err)
 	}
 
-	// Hex-encode signature and patch Contents in the increment buffer.
-	sigHexLen := hex.EncodedLen(len(pkcs7Sig))
+	// Hex-encode the DER signature directly into the increment buffer.
+	// The placeholder was pre-filled with zeros; we overwrite from the left with
+	// the actual hex and leave trailing zeros as padding (valid per PDF spec).
+	sigHexLen := len(pkcs7Sig) * 2
 	if sigHexLen > contentsPlaceholderLen {
 		return fmt.Errorf("PKCS#7 signature too large: %d hex chars (max %d)", sigHexLen, contentsPlaceholderLen)
 	}
-	hexBuf := hexBufPool.Get().(*[]byte)
-	for i := range *hexBuf {
-		(*hexBuf)[i] = '0'
-	}
-	hex.Encode(*hexBuf, pkcs7Sig)
-	for i := 0; i < sigHexLen; i++ {
-		c := (*hexBuf)[i]
-		if c >= 'a' && c <= 'f' {
-			(*hexBuf)[i] = c - 32
-		}
-	}
-	copy(incrBytes[offsets.contentsHexInIncr:offsets.contentsHexEndIncr], *hexBuf)
-	hexBufPool.Put(hexBuf)
+	// Encode directly into the increment buffer using uppercase hex.
+	encodeUpperHex(incrBytes[offsets.contentsHexInIncr:offsets.contentsHexInIncr+sigHexLen], pkcs7Sig)
 
 	// Write to dst: original PDF + patched increment.
 	if _, err := src.Seek(0, io.SeekStart); err != nil {
@@ -635,38 +738,41 @@ func (s *Signer) SignAndEncrypt(params SignParams, enc EncryptParams) error {
 		return fmt.Errorf("EncryptParams.Password is required")
 	}
 
-	srcFile, err := os.Open(params.Src)
+	// Read entire source into memory for the fastest signing path (SignBytes).
+	pdfData, err := os.ReadFile(params.Src)
 	if err != nil {
-		return fmt.Errorf("open input PDF: %w", err)
+		return fmt.Errorf("read input PDF: %w", err)
 	}
-	defer srcFile.Close()
 
 	destPath := params.Dest
 	if destPath == "" {
 		destPath = params.Src
 	}
 
-	// Sign to a temp file, then encrypt to dest.
-	tmpFile, err := os.CreateTemp("", "gopdfsigner-*.pdf")
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
-	}
-	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
-
-	if err := s.SignStream(srcFile, tmpFile, params); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("sign PDF: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		return fmt.Errorf("close temp file: %w", err)
-	}
-
 	keyLength := 128
 	if enc.AES256 {
 		keyLength = 256
 	}
-	return encryptPDF(tmpPath, destPath, enc.Password, keyLength)
+
+	// Sign in memory — fastest path with contiguous byte slices.
+	signedData, err := s.SignBytes(pdfData, params)
+	if err != nil {
+		return fmt.Errorf("sign PDF: %w", err)
+	}
+
+	// Encrypt directly from memory to the destination file, avoiding temp files.
+	dstFile, err := os.Create(destPath)
+	if err != nil {
+		return fmt.Errorf("create output PDF: %w", err)
+	}
+	defer dstFile.Close()
+
+	signedReader := bytes.NewReader(signedData)
+	if err := encryptPDFStream(signedReader, dstFile, enc.Password, keyLength); err != nil {
+		return fmt.Errorf("encrypt PDF: %w", err)
+	}
+
+	return nil
 }
 
 // SignBytes signs PDF bytes in memory and returns the signed PDF bytes.
@@ -693,7 +799,9 @@ func (s *Signer) SignBytes(pdfData []byte, params SignParams) ([]byte, error) {
 
 	incrBytes := incr.Bytes()
 
-	// Combine original + increment into result.
+	// Combine original + increment into a single contiguous buffer.
+	// Unlike SignStream which writes src then incr separately, SignBytes patches
+	// everything in memory for zero-copy hashing on contiguous slices.
 	result := make([]byte, len(pdfData)+len(incrBytes))
 	copy(result, pdfData)
 	copy(result[len(pdfData):], incrBytes)
@@ -703,17 +811,9 @@ func (s *Signer) SignBytes(pdfData []byte, params SignParams) ([]byte, error) {
 	contentValueEnd := srcSize + int64(offsets.contentsHexEndIncr) + 1
 	totalLen := int64(len(result))
 
-	// Patch ByteRange.
+	// Patch ByteRange directly in the result buffer (no fmt.Sprintf allocation).
 	byteRangePos := int(srcSize) + offsets.byteRangeInIncr
-	byteRange := fmt.Sprintf("/ByteRange [0 %010d %010d %010d]",
-		contentValueStart,
-		contentValueEnd,
-		totalLen-contentValueEnd,
-	)
-	if len(byteRange) != len(byteRangePlaceholder) {
-		return nil, fmt.Errorf("ByteRange length mismatch: got %d, want %d", len(byteRange), len(byteRangePlaceholder))
-	}
-	copy(result[byteRangePos:], []byte(byteRange))
+	formatByteRange(result, byteRangePos, contentValueStart, contentValueEnd, totalLen-contentValueEnd)
 
 	// Hash signed ranges — single Write calls on contiguous slices.
 	h := hashPool.Get().(hash.Hash)
@@ -728,31 +828,23 @@ func (s *Signer) SignBytes(pdfData []byte, params SignParams) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("private key must be RSA")
 	}
-	pkcs7Sig, err := buildPKCS7Signature(rsaKey, s.cfg.Chain, contentHash, signingTime)
+	pkcs7Sig, err := buildPKCS7Signature(rsaKey, s.cfg.Chain, s.certBytesDER, contentHash, signingTime)
 	if err != nil {
 		return nil, fmt.Errorf("build PKCS#7 signature: %w", err)
 	}
 
-	// Hex-encode and patch Contents.
-	sigHexLen := hex.EncodedLen(len(pkcs7Sig))
+	// Hex-encode and patch Contents directly in the combined result buffer.
+	// We encode directly into the result buffer's Contents region, avoiding an
+	// intermediate copy through the hex pool. The region is already zero-filled
+	// (from the contentsZeros placeholder), so we only need to overwrite the
+	// actual signature hex chars.
+	sigHexLen := len(pkcs7Sig) * 2
 	if sigHexLen > contentsPlaceholderLen {
 		return nil, fmt.Errorf("PKCS#7 signature too large: %d hex chars (max %d)", sigHexLen, contentsPlaceholderLen)
 	}
 	contentsHexStart := int(srcSize) + offsets.contentsHexInIncr
-	contentsHexEnd := int(srcSize) + offsets.contentsHexEndIncr
-	hexBuf := hexBufPool.Get().(*[]byte)
-	for i := range *hexBuf {
-		(*hexBuf)[i] = '0'
-	}
-	hex.Encode(*hexBuf, pkcs7Sig)
-	for i := 0; i < sigHexLen; i++ {
-		c := (*hexBuf)[i]
-		if c >= 'a' && c <= 'f' {
-			(*hexBuf)[i] = c - 32
-		}
-	}
-	copy(result[contentsHexStart:contentsHexEnd], *hexBuf)
-	hexBufPool.Put(hexBuf)
+	// Encode directly into the result buffer using uppercase hex.
+	encodeUpperHex(result[contentsHexStart:contentsHexStart+sigHexLen], pkcs7Sig)
 
 	return result, nil
 }

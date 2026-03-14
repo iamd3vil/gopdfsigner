@@ -1,3 +1,14 @@
+// Package gopdfsigner provides PDF digital signing using PKCS#7 detached signatures.
+//
+// It appends an incremental update to the original PDF (leaving the original bytes
+// untouched) containing the signature dictionary, widget annotation, and optionally
+// a visible signature appearance. Three signing paths are provided:
+//
+//   - Sign: file-to-file convenience method
+//   - SignStream: streaming I/O with seekable input (most memory-efficient)
+//   - SignBytes: in-memory operation on byte slices (fastest when PDF is already loaded)
+//
+// All methods are safe for concurrent use.
 package gopdfsigner
 
 import (
@@ -52,4 +63,8 @@ type EncryptParams struct {
 // Signer signs PDF documents with PKCS#7 digital signatures.
 type Signer struct {
 	cfg Config
+
+	// Pre-computed DER-encoded certificate chain bytes for PKCS#7 signatures.
+	// Computed once at creation time to avoid per-call allocation and copying.
+	certBytesDER []byte
 }

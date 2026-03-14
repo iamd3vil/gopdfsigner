@@ -155,6 +155,39 @@ func BenchmarkSignStreamVisibleParallel(b *testing.B) {
 	}
 }
 
+func BenchmarkSignAndEncrypt(b *testing.B) {
+	signer := newBenchmarkSigner(b)
+	basePDF := loadBenchmarkBasePDF(b)
+	pdfs := makeBenchmarkPDFs(basePDF)
+
+	for _, tc := range benchmarkSizes {
+		pdfData := pdfs[tc.name]
+		b.Run(tc.name, func(b *testing.B) {
+			dir := b.TempDir()
+			inPath := filepath.Join(dir, "input.pdf")
+			if err := os.WriteFile(inPath, pdfData, 0o644); err != nil {
+				b.Fatal(err)
+			}
+
+			b.ReportAllocs()
+			b.SetBytes(int64(len(pdfData)))
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				outPath := filepath.Join(dir, fmt.Sprintf("output-%d.pdf", i))
+				err := signer.SignAndEncrypt(
+					SignParams{Src: inPath, Dest: outPath},
+					EncryptParams{Password: "secret"},
+				)
+				if err != nil {
+					b.Fatal(err)
+				}
+				os.Remove(outPath)
+			}
+		})
+	}
+}
+
 func BenchmarkPKCS7Signature(b *testing.B) {
 	signer := newBenchmarkSigner(b)
 
@@ -174,8 +207,9 @@ func BenchmarkPKCS7Signature(b *testing.B) {
 	b.SetBytes(int64(len(contentHash)))
 	b.ResetTimer()
 
+	certBytesDER := signer.certBytesDER
 	for i := 0; i < b.N; i++ {
-		_, err := buildPKCS7Signature(rsaKey, chain, contentHash[:], signingTime)
+		_, err := buildPKCS7Signature(rsaKey, chain, certBytesDER, contentHash[:], signingTime)
 		if err != nil {
 			b.Fatal(err)
 		}
